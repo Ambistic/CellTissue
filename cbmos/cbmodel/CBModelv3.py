@@ -8,13 +8,12 @@ import time
 from .. import cell as _cl
 
 from ._eventqueue import EventQueue
-from .CBModelv2 import CBModelv2
-from .CBModelv3 import CBModelv3
+from ..utils import generate_cartesian_coordinates
 
 _NU = 1
 
 
-class CBModel:
+class CBModelv3:
     """
     Parameters
     -----------
@@ -31,169 +30,90 @@ class CBModel:
             Numpy itself.
 
     """
-    def __init__(self, force, solver, dimension=3, separation=0.3, hpc_backend=_np):
+    def __init__(self, force, solver, force_args, solver_args, cells=None,
+                 dimension=3, separation=0.3, hpc_backend=_np,
+                ):
         self.force = force
         self.solver = solver
+        self.force_args = force_args
+        self.solver_args = solver_args
+        if cells is not None:
+            self.build_cells(cells)
+        else:
+            self.cells = list()
+            self.ids_to_cells = dict()
+            self.next_cell_index = 0
+        
         self.dim = dimension
         self.separation = separation
         self.hpc_backend = hpc_backend
-
-    def simulate(
-            self,
-            cell_list,
-            t_data,
-            force_args,
-            solver_args,
-            seed=None,
-            raw_t=True,
-            max_execution_time=None,
-            min_event_resolution=0.,
-            ):
-        """
-        Run the simulation with the given arguments and return the position
-        of the cells at each time steps in `t_data`
-
-        Parameters
-        ----------
-        cell_list: [Cell]
-            Initial cell layout
-        t_data: [float]
-            times at which the history should be recorded, if `raw_t` is set to `True`,
-            only the start and end time are taken into account and the rest is ignored.
-            The history is then recorded following the solver's output.
-        force_args: dict
-            arguments to pass to the force function
-        solver_args: dict
-            arguments to pass to the solver
-        seed: int
-            seed for the random number generator
-        raw_t: bool
-            whether or not to use the solver's raw output. In that case, `t_data`
-            is ignored and the raw times are returned along the history
-        max_execution_time: float
-            Maximum execution time in seconds that the simulation should use.
-            Since the elapsed time is only checked in between cell events, this
-            only represents an approximate target. The exact duration is saved
-            in self.last_exec_time
-        min_event_resolution: float
-            Minimum event resolution interval: events occurring within
-            `min_event_resolution` of the current time will be resolved
-            immediately.
-
-        Returns
-        -------
-        (t_data, history)
-
-        Note
-        ----
-        - Cell ordering in the output can vary between timepoints.
-        - Cell indices need to be unique for the whole duration of the simulation.
-        - If `raw_t` is false, t_data is returned as is, with the history. If
-          `raw_t` is true, aggregated t_data from the solver is returned.
-
-        """
-
-        exec_time_start = time.time()
-
-        _npr.seed(seed)
-
-        for cell in cell_list:
-                assert len(cell.position) == self.dim
-
-        _logging.debug("Starting new simulation")
-
-        t = t_data[0]
-        t_end = t_data[-1]
-        self.cell_list = [
-                _cl.Cell(
-                    cell.ID, cell.position, cell.birthtime,
-                    cell.proliferating, cell.generate_division_time,
-                    cell.division_time, cell.parent_ID)
-                for cell in cell_list]
-
-        self.next_cell_index = max(self.cell_list, key=lambda cell: cell.ID).ID + 1
+        
         self.history = []
-        self.t_data = [t] if raw_t else t_data[:]
-        self._save_data()
+        
+    def build_cells(self, cells):
+        self.cells = cells
+        self.ids_to_cells = {c.ID: c for c in self.cells}
+        self.next_cell_index = max([c.ID for c in self.cells]) + 1
+        
+    def init_square(self, size=6):
+        coordinates = generate_cartesian_coordinates(size, size)
+        cells = [_cl.Cell(i, [x, y])
+                 for i, (x, y) in enumerate(coordinates)]
+        self.build_cells(cells)
+        
+    def export(self):
+        return {c.ID: c.position for c in self.history[-1]}
+        
+    def get_ids(self):
+        return [c.ID for c in self.cells]
+        
+    def tick(self, current_time, time_step):
+        y0 = _np.array([cell.position for cell in self.cells]).reshape(-1)
 
-        # build event queue once, since independent of environment (for now)
-        self._queue = EventQueue(
-                [(cell.division_time, cell) for cell in self.cell_list],
-                min_resolution=min_event_resolution,
-                )
+        sol = self._calculate_next_positions(current_time, current_time + time_step,
+                                             y0)
 
-        while t < t_end:
+        # save data for all t_data points passed
+        self._save_data(sol.y[:, -1].reshape(-1, self.dim))
 
-            # check if max_execution_time has elapsed
-            exec_time = time.time() - exec_time_start
-            if max_execution_time is not None and exec_time >= max_execution_time:
-                self.last_exec_time = exec_time
-                return (self.t_data, self.history)
-
-            # generate next event
-            tau, cells = self._queue.pop()
-
-            if tau > t:
-                # calculate positions until the last t_data smaller or equal to min(tau, t_end)
-                t_eval = [t] \
-                    + [time for time in self.t_data if t < time <= min(tau, t_end)]
-                y0 = _np.array([cell.position for cell in self.cell_list]).reshape(-1)
-                # only calculate positions if there is t_data before tau
-                if len(t_eval) > 1:
-                    sol = self._calculate_positions(t_eval, y0, force_args, solver_args, raw_t=raw_t)
-
-                    # save data for all t_data points passed
-                    for y_t in sol.y[:, 1:].T:
-                        self._save_data(y_t.reshape(-1, self.dim))
-                    if raw_t:
-                        self.t_data.extend(sol.t[1:])
-
-                # check if max_execution_time has elapsed
-                exec_time = time.time() - exec_time_start
-                if max_execution_time is not None and exec_time >= max_execution_time:
-                    self.last_exec_time = exec_time
-                    return (self.t_data, self.history)
-
-                # continue the simulation until tau if necessary
-                if tau > t_eval[-1] and tau <=t_end:
-                    y0 = sol.y[:, -1] if len(t_eval) > 1 else y0
-                    sol = self._calculate_positions([t_eval[-1], tau], y0, force_args, solver_args, raw_t=raw_t)
-
-                    if raw_t:
-                        for y_t in sol.y[:, 1:].T:
-                            self._save_data(y_t.reshape(-1, self.dim))
-                        self.t_data.extend(sol.t[1:])
-                elif tau > t_end and raw_t:
-                    # continue the simulation until t_end (only necessary if
-                    # t_end is not in t_eval because raw_t is true (default))
-                    y0 = sol.y[:, -1] if len(t_eval) > 1 else y0
-                    sol = self._calculate_positions([t_eval[-1], t_end], y0, force_args, solver_args, raw_t=raw_t)
-
-                    #if raw_t:
-                    for y_t in sol.y[:, 1:].T:
-                        self._save_data(y_t.reshape(-1, self.dim))
-                    self.t_data.extend(sol.t[1:])
-
-                # update the positions for the current time point
-                self._update_positions(sol.y[:, -1].reshape(-1, self.dim).tolist())
-
-            # check if max_execution_time has elapsed
-            exec_time = time.time() - exec_time_start
-            if max_execution_time is not None and exec_time >= max_execution_time:
-                self.last_exec_time = exec_time
-                return (self.t_data, self.history)
-
-            # apply event if tau <= t_end
-            if tau <= t_end:
-                for cell in cells:
-                    self._apply_division(cell, tau)
-
-            # update current time t to min(tau, t_end)
-            t = min(tau, t_end)
-
-        exec_time = time.time() - exec_time_start
-        self.last_exec_time = exec_time
-        return (self.t_data, self.history)
+        # update the positions for the current time point
+        self._update_positions(sol.y[:, -1].reshape(-1, self.dim).tolist())
+        
+    def _calculate_next_positions(self, time_start, time_end, y0, raw_t=True):
+        _logging.debug("Calling solver with: t0={}, tf={}".format(
+            time_start, time_end))
+        return self.solver(self._ode_system(self.force_args),
+                           (time_start, time_end),
+                           y0,
+                           **self.solver_args)
+    
+    def divide_cell(self, cell_id):
+        cell = self.ids_to_cells[cell_id]
+        del self.ids_to_cells[cell_id]
+        cell, daughter_cell = self._apply_division(cell, 0)
+        self.ids_to_cells[daughter_cell.ID] = daughter_cell
+        self.ids_to_cells[cell.ID] = cell
+        return cell.ID, daughter_cell.ID
+    
+    def remove_cell(self, cell_id):
+        cell = self.ids_to_cells[cell_id]
+        del self.ids_to_cells[cell_id]
+        self.cells.remove(cell)
+        
+    def get_neighbours(self, cell_id):
+        # compute all dists, then pick ones below a threshold
+        ref = self.ids_to_cells[cell_id]
+        dists = [(self.hpc_backend.linalg.norm(ref.position - cell.position), cell.ID)
+                  for cell in self.cells]
+        dists.sort()
+        idx = 0
+        _len = len(dists)
+        while idx < _len and dists[idx][0] < 1.5:
+            idx += 1
+        return [x[1] for x in dists[1:idx]]
+    
+    def get_all_neighbours(self):
+        pass
 
     def _save_data(self, positions=None):
         """
@@ -211,13 +131,13 @@ class CBModel:
                     cell.ID, pos, cell.birthtime, cell.proliferating,
                     cell.generate_division_time, cell.division_time,
                     cell.parent_ID)
-                for cell, pos in zip(self.cell_list, positions)])
+                for cell, pos in zip(self.cells, positions)])
         else:
             self.history.append([_cl.Cell(
                     cell.ID, cell.position, cell.birthtime, cell.proliferating,
                     cell.generate_division_time, cell.division_time,
                     cell.parent_ID)
-                for cell in self.cell_list])
+                for cell in self.cells])
 
     def _get_division_direction(self):
 
@@ -248,30 +168,32 @@ class CBModel:
         The code assumes that all cell events are division events,
         """
 
-        #check that the parent cell has set its proliferating flag to True
-        assert cell.proliferating
-
         division_direction = self._get_division_direction()
         updated_position_parent = cell.position -\
             0.5 * self.separation * division_direction
         position_daughter = cell.position +\
             0.5 * self.separation * division_direction
+        
+        current_cell_index = self.next_cell_index
 
         daughter_cell = _cl.Cell(
-                self.next_cell_index, position_daughter, birthtime=tau,
+                current_cell_index, position_daughter, birthtime=tau,
                 proliferating=True,
                 division_time_generator=cell.generate_division_time,
                 parent_ID=cell.ID)
         self.next_cell_index = self.next_cell_index + 1
-        self.cell_list.append(daughter_cell)
-        self._queue.push(daughter_cell.division_time, daughter_cell)
+        self.cells.append(daughter_cell)
+
+        cell.ID = self.next_cell_index
+        self.next_cell_index = self.next_cell_index + 1
 
         cell.position = updated_position_parent
         cell.division_time = cell.generate_division_time(tau)
-        self._queue.push(cell.division_time, cell)
 
         _logging.debug("Division event: t={}, direction={}".format(
             tau, division_direction))
+        
+        return cell, daughter_cell
 
     def _calculate_positions(self, t_eval, y0, force_args, solver_args, raw_t=True):
         _logging.debug("Calling solver with: t0={}, tf={}".format(
@@ -289,7 +211,7 @@ class CBModel:
         The ordering in cell_list and sol.y has to match.
         """
 
-        for cell, pos in zip(self.cell_list, y):
+        for cell, pos in zip(self.cells, y):
             cell.position = _np.array(pos)
 
     def _ode_system(self, force_args):
